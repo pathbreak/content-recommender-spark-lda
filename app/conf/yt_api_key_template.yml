@@ -1,0 +1,4 @@
+# Make a copy of this file as 'yt_api_key.yml', open it in an editor,
+# and insert your YouTube API key there between the double quotes. 
+# See https://developers.google.com/youtube/v3/getting-started#before-you-start on how to get an API key.
+key: ""

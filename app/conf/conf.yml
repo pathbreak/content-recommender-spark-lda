@@ -1,0 +1,44 @@
+---
+# Path under which browsing history content should be stored. 
+# This will eventually support HDFS URLs, but as of now should be local filesystem directory.
+HISTORY_DIR: ./historydata
+
+# Path under which target URL content should be stored. 
+# This will eventually support HDFS URLs, but as of now should be local filesystem directory.
+TARGET_DIR: ./targetdata
+
+# A TARGET is a website or web resource whose contents should be analyzed
+# by the system for finding recommendations that are similar to your interests
+# based on analysis of your browsing history.
+# Every target has a 
+#   - name: a friendly name for the target.
+#   - type: a type that decides which target handler plugin handles the target.
+#           This should match the 'self.type' attribute of one of the target handlers.
+#   - <other handler specific attributes documented in respective handler's source code>
+TARGETS:
+- name: tech-reddit
+  url: https://www.reddit.com/r/technology+hardware+programming+electronics+gadgets/.rss?limit=200
+  type: feed
+
+- name: tech-reddit-comments
+  url: https://www.reddit.com/r/technology+hardware+programming+electronics+gadgets/comments.rss?limit=200
+  type: feed
+
+- name: ml-datascience-reddit
+  url: https://www.reddit.com/r/MachineLearning+datascience/.rss?limit=200
+  type: feed
+    
+- name: ml-datascience-reddit-comments
+  url: https://www.reddit.com/r/MachineLearning+datascience/comments.rss?limit=200
+  type: feed
+    
+  # period: (Optional) Makes youtube API search only in last 6 hours. This should be 
+  #         synchronized with the cron job period if you don't want to miss anything.
+  #         If not specified, default is last 6 hours.
+  # query: (Optional) Makes youtube API search only matching videos. Kind of pointless
+  #         when the whole point of topic modelling is to find content with
+  #         hidden relationships, but use it if you know what you're doing.
+- name: youtube-latest
+  type: youtube
+  period: 6
+    
