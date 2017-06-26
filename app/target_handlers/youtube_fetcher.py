@@ -3,6 +3,7 @@ from apiclient import discovery
 import json
 import datetime
 import traceback
+import yaml
 import os
 from pprint import pprint
 
@@ -22,7 +23,7 @@ class YoutubeFetcher(object):
     '''
     
     DEFAULT_PERIOD = 6  # Hours, in case there's no 'period' in conf.yml. 
-    API_KEY_FILE = 'yt_api_key.txt'
+    API_KEY_FILE = 'yt_api_key.yml'
     
     def __init__(self):
         self.type = 'youtube'
@@ -49,16 +50,21 @@ class YoutubeFetcher(object):
         
         
     def get_youtube_service(self):
+        key_error = ("Error: YouTube API key file conf/yt_api_key.yml not found or API key is not present in that file.\n"
+                "Obtain an API key as explained in https://developers.google.com/youtube/v3/getting-started#before-you-start.\n"
+                "Then create a copy of conf/yt_api_key_template.yml as conf/yt_api_key.yml and insert the key in it.")
+                
         yt_api_key_file = os.path.join(self.app_conf['CONF_DIR'], self.API_KEY_FILE)
         if not os.path.exists(yt_api_key_file):
-            raise RuntimeError("Error: YouTube API key file %s not found.\nObtain an API key as " + 
-                "explained in https://developers.google.com/youtube/v3/getting-started#before-you-start.\n" + 
-                "Then create a copy of conf/yt_api_key_template.yml as conf/yt_api_key.yml and insert the key in it." % (yt_api_key_file))
+            raise RuntimeError(key_error)
                 
         with open(yt_api_key_file, 'r') as cred_file:
-            creds = cred_file.read()
-        
-        service = discovery.build('youtube', 'v3', developerKey=creds)
+            creds = yaml.load(cred_file)
+        api_key = creds.get('key', '')
+        if not api_key:
+            raise RuntimeError(key_error)
+            
+        service = discovery.build('youtube', 'v3', developerKey=api_key)
         
         return service
 

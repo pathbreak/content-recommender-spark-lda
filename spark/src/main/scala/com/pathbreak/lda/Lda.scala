@@ -18,7 +18,12 @@ object Lda {
         val testingDirectory = args(1)
         val numTopics = args(2).toInt
         val iterations = args(3).toInt
-        val algo = if (args.length > 4) args(4) else "online" // "em" | "online"
+
+        // Making EM (Expectation Maximization) as default algorithm 
+        // because it's much more stable, less resource intensive and far faster
+        // than online (variational Bayes) implementation.
+        val algo = if (args.length > 4) args(4) else "em" // "em" | "online"
+        
         val customStopsFile = if (args.length > 5) args(5) else null
         val fileFormat = if (args.length > 6) args(6) else "json"
         

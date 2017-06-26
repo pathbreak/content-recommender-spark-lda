@@ -5,7 +5,7 @@ SPARK_VERSION='spark-2.1.1/spark-2.1.1-bin-hadoop2.7.tgz'
 # Prepare the system to run this script.
 init() {
     apt-get -y update
-    apt-get -y install jq curl wget tar bc
+    apt-get -y install tmux jq curl wget tar bc
     
     mkdir -p /root/spark
     mkdir -p /root/spark/data
@@ -13,7 +13,7 @@ init() {
     mkdir -p /root/spark/data/targetdata
     mkdir -p /root/spark/data/spark-events
     mkdir -p /root/spark/data/spark-csv
-        
+    
 }
 
 install_master() {
@@ -26,21 +26,16 @@ install_master() {
 
 install_master_node_prerequisites() {
     # Install sbt repo
-    echo "deb https://dl.bintray.com/sbt/debian /" | tee -a /etc/apt/sources.list.d/sbt.list
+    echo "deb https://dl.bintray.com/sbt/debian /" | tee /etc/apt/sources.list.d/sbt.list
     apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv 2EE0EA64E40A89B84B2DF73499E82A75642AC823
     
     apt-get -y update
-    apt-get -y install tmux openjdk-8-jre-headless dstat python3 python3-pip git sbt
+    apt-get -y install openjdk-8-jre-headless dstat python3 python3-pip git
     
     # Create Python environment for recommender app.
-    pip3 install virtualenv
+    pip3 install google-api-python-client beautifulsoup4 feedparser PyYAML requests
     
-    if [ ! -d "/root/spark/recommender/app/pyenv" ]; then
-        virtualenv -p python3 /root/spark/recommender/app/pyenv
-        source /root/spark/recommender/app/pyenv/bin/activate
-        pip install google-api-python-client beautifulsoup4 feedparser PyYAML requests
-        deactivate
-    fi
+    apt-get -y install sbt
 }
 
 
@@ -67,15 +62,17 @@ install_spark() {
     local archive_root_dir="$(tar -tzf spark.tgz|head -1|sed 's|/.*||')"
     local installed_dir="$(echo "$target_dir/$archive_root_dir"|tr -s '/')"
     
-    cp "/root/spark/recommender/deploy/spark-defaults.conf" "$installed_dir/conf/"
-    cp "/root/spark/recommender/deploy/metrics.properties" "$installed_dir/conf/"
+    cp "/root/spark/recommender/deploy/spark-defaults.conf" "$archive_root_dir/conf/"
+    cp "/root/spark/recommender/deploy/metrics.properties" "$archive_root_dir/conf/"
     
     echo "Spark installed in: $installed_dir"
 }
 
 install_recommender_app() {
-    # TODO
+
     git clone https://github.com/pathbreak/content-recommender-spark-lda /root/spark/recommender
+    
+    chmod +x /root/spark/recommender/app/recommender_app.py
     
     sed -i 's|^HISTORY_DIR.*$|HISTORY_DIR: /root/spark/data/historydata|' /root/spark/recommender/app/conf/conf.yml
     sed -i 's|^TARGET_DIR.*$|TARGET_DIR: /root/spark/data/targetdata|' /root/spark/recommender/app/conf/conf.yml
@@ -97,6 +94,12 @@ install_recommender_app() {
 #   $6 -> Algorithm to use. "online"|"em"
 #   $7 -> Path of a customs stop word list file
 run_lda_local() {
+    local spark_dir="$1"
+    if [ ! -f "$spark_dir/bin/spark-submit" ]; then
+        echo "Error: $spark_dir does not seem to be a Spark installation."
+        return 1
+    fi
+
     # Runs the LDA spark app in local execution mode on the master node.
     # The important settings are:
     #   --driver-memory MEM : Sets maximum heap space -Xmx to MEM
@@ -104,34 +107,88 @@ run_lda_local() {
     #           results that exceed the default 1G size.
     local system_ram_mb=$(grep MemTotal /proc/meminfo | awk '{print $2}' | xargs -I {} echo "{}/1024" | bc)
     
-    # Set driver max heap space to system_ram_mb - 512 MB
-    local driver_max_heap_mb=$(echo "$system_ram_mb - 512" | bc)
-    local max_result_size_mb=$((driver_max_heap_mb / 2))
+    # Set driver max heap space to 70% of system_ram_mb. For bc to give integer results,
+    # the operation has to be a division.
+    local driver_max_heap_mb=$(echo "scale=0;$system_ram_mb * 7/10" | bc)
+    local max_result_size_mb=$(echo "scale=0;$driver_max_heap_mb * 1/2" | bc)
     
-    local spark_dir="$1"
+    local run_dir="/root/spark/data/sys-$(date +%Y-%m-%d-%H-%M-%S)"
+    start_system_metrics "$run_dir"
+    
     "$spark_dir/bin/spark-submit" --driver-memory "$driver_max_heap_mb"M \
         --conf spark.driver.maxResultSize="$max_result_size_mb"M \
         /root/spark/lda-prototype.jar \
-        "$2" "$3" "$4" "$5"
+        "$2" "$3" "$4" "$5" "$6" 2>&1 | tee -a "$run_dir/stdlogs"
+    
+    # Wait for sometime before stopping metrics collection, because memory and disk
+    # cleanup take some time.
+    sleep 15
+    stop_system_metrics
+}
+
+
+
+# Starts the Spark master and a slave daemon on this machine's private IP address.
+#   $1 -> The directory where a spark installation exists.
+start_cluster() {
+    local spark_dir="$1"
+    if [ ! -f "$spark_dir/sbin/start-master.sh" ]; then
+        echo "Error: $spark_dir does not seem to be a Spark installation."
+        return 1
+    fi
+    
+    # Since master script will requires non-interactive ssh access to slaves when job is started, 
+    # we'll create a private key here.
+    if [ ! -f /root/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa 
+    fi
+
+    # Master daemon uses SPARK_LOCAL_IP only for port 8080 (WebUI), 
+    # and --host for ports 6066 (REST endpoint) and 7077 (service)
+    local private_ip=$(ip addr | grep 'eth0:1' | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+    
+    SPARK_LOCAL_IP=$private_ip  SPARK_PUBLIC_DNS=$private_ip  \
+        "$spark_dir/sbin/start-master.sh" \
+        "--host $private_ip"
+    
+    SPARK_LOCAL_IP=$private_ip SPARK_PUBLIC_DNS=$private_ip  \
+        "$spark_dir/sbin/start-slave.sh" "--port 7078" \
+        "--host $private_ip" "spark://$private_ip:7077"     
+}
+
+# Stops the Spark master and slave daemons on this machine.
+#   $1 -> The directory where a spark installation exists.
+stop_cluster() {
+    local spark_dir="$1"
+    if [ ! -f "$spark_dir/sbin/stop-master.sh" ]; then
+        echo "Error: $spark_dir does not seem to be a Spark installation."
+        return 1
+    fi
+
+    "$spark_dir/sbin/stop-slave.sh" 
+    
+    "$spark_dir/sbin/stop-master.sh"
 }
 
 
 # Start system CPU and memory usage collection using dstat.
-#  $1 -> Output to this file
+#  $1 -> Output metrics to this directory
 start_system_metrics() {
-    local report_file="$1"
+    local report_dir="$1"
 
     if [ -f "/root/.dstat_pid" ]; then
-        echo "Error: Reporting is already started. Stop it first."
+        echo "Error: Reporting is already started. Stop it first using stop-metrics or kill dstat process and delete /root/.dstat_pid"
         return 1
     fi
     
     # Since dstat appends a bunch of headers and newlines on every call by default, the CSV file becomes
     # difficult to process. So prevent user from collecting to an existing file.
-    if [ -f "$report_file" ]; then
-        echo "Error: Report file already exists. Provide a different filename."
+    if [ -d "$report_dir" ]; then
+        echo "Error: Report directory already exists. Provide a different directory."
         return 1
     fi
+    
+    mkdir -p "$report_dir"
     
     # Find number of processors.
     local num_cpus=$(cat /proc/cpuinfo | grep '^processor' | wc -l)
@@ -139,21 +196,62 @@ start_system_metrics() {
     # dstat output columns are:
     #--epoch--- -------cpu0-usage--------------cpu1-usage--------------cpu2-usage--------------cpu3-usage------- ------memory-usage-----
     #   epoch   |usr sys idl wai hiq siq:usr sys idl wai hiq siq:usr sys idl wai hiq siq:usr sys idl wai hiq siq| used  buff  cach  free
-    nohup dstat -T -c -C "$cpu_ids" -m --noheaders --output "$report_file" > /dev/null 2>&1 &
+    nohup dstat -T -c -C "$cpu_ids" -m --noheaders --output "$report_dir/dstat.csv" > /dev/null 2>&1 &
     local dstat_pid=$!
     echo "$dstat_pid" > "/root/.dstat_pid"
+    
+    # Collect disk free metrics. This is because Spark consumes 10s of GBs of /tmp for shuffle operations.
+    nohup ./master.sh collect-df "$report_dir/df.csv" 5 > /dev/null 2>&1  &
+    local df_pid=$!
+    echo "$df_pid" > "/root/.df_pid"
+    
+    echo "Started CPU, RAM, disk space collection to $report_dir"
     
     return 0
 }
 
 stop_system_metrics() {
-    if [ ! -f "/root/.dstat_pid" ]; then
+    if [ -f "/root/.dstat_pid" ]; then
+    
+        kill -9 "$(cat /root/.dstat_pid)"
+        if [ $? -eq 0 ]; then
+            echo "Stopped dstat metrics collection"
+            rm -f "/root/.dstat_pid"
+        else
+            echo "Unable to stop dstat metrics collection. Kill PID $(cat /root/.dstat_pid) manually."
+        fi
+    else
         echo "Error: Does not look like dstat is running"
-        return 1
     fi
-    kill -9 "$(cat /root/.dstat_pid)"
-    rm -f "/root/.dstat_pid"
+
+    if [ -f "/root/.df_pid" ]; then
+    
+        kill -9 "$(cat /root/.df_pid)"
+        if [ $? -eq 0 ]; then
+            echo "Stopped df metrics collection"
+            rm -f "/root/.df_pid"
+        else
+            echo "Unable to stop df metrics collection. Kill PID $(cat /root/.df_pid) manually."
+        fi
+    else
+        echo "Error: Does not look like df is running"
+    fi
+    
 }
+
+
+# Periodically collects disk free stats for /dev/root
+# $1 -> Report file
+# $2 -> Interval between collections
+collect_df() {
+    report_file=$1
+    interval=$2
+
+    while sleep "$interval"; do
+        echo "$(date +%s) $(df -h | grep /dev/root)" | awk '{printf "%s,%s,%s,%s\n",$1,$3,$4,$5}' >> "$report_file"
+    done
+}
+
 
 
 
@@ -167,15 +265,28 @@ disable_nfs_sharing() {
     systemctl stop nfs-kernel-server.service
 }
 
+
 # Add a Spark slave as permitted NFS client.
-#   $1 => The private IP address of client in CIDR notation. Example: 192.168.11.239/17
+#   $1 => The private IP address of client. Example: 192.168.11.239
+add_slave() {
+    ssh-copy-id -i /root/.ssh/id_rsa "$1"
+    
+    add_nfs_client "$1"
+}
+
+# Add a Spark slave as permitted NFS client.
+#   $1 => The private IP address of client.
 add_nfs_client() {
     # /etc/exports allows the same directory to be repeated on multiple lines for different clients.
     # This makes grepping and adding or replacing much easier compared to having all clients on a 
     # single line.
+    # The /17 subnet after slave's IP address is required.
     local worker_ip="$1"
-    echo "/root/spark/data    $1(rw,sync,no_subtree_check,no_root_squash)" > /etc/exports
-    exportfs -a
+    grep '/root/spark/data' /etc/exports | grep $worker_ip
+    if [ $? -ne 0 ]; then
+        echo "/root/spark/data    $worker_ip/17(rw,sync,no_subtree_check,no_root_squash)" > /etc/exports
+        exportfs -a
+    fi
 }
 
 
@@ -217,6 +328,10 @@ case "$1" in
     install_master
     ;;
     
+    install-prereqs)
+    install_master_node_prerequisites
+    ;;
+    
     install-spark)
     install_spark "$2"
     ;;
@@ -230,12 +345,29 @@ case "$1" in
     run_lda_local "${@:2}"
     ;;
     
+    start-cluster)
+    start_cluster "$2"
+    ;;
+
+    stop-cluster)
+    stop_cluster "$2"
+    ;;
+
+    add-slave)
+    add_slave "$2"
+    ;;
+        
+    
     start-metrics)
-    start_system_metrics "$1"
+    start_system_metrics "$2"
     ;;
     
     stop-metrics)
-    stop_system_metrics "$1"
+    stop_system_metrics "$2"
+    ;;
+    
+    collect-df)
+    collect_df "$2" "$3"
     ;;
 
     enable-nfs)
@@ -250,4 +382,5 @@ case "$1" in
     *)
     echo "Unknown command: $1"
     ;;
+
 esac

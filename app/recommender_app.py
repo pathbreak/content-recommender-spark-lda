@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import print_function
 import os.path
 import yaml
@@ -56,21 +57,24 @@ def configure_arguments_parser():
     fetch_parser = actions.add_parser('fetch', help='Download content from all configured targets (mainly meant for cron job)')
     
     args = parser.parse_args()
-    return args
+    return args, parser
     
 
 if __name__ == '__main__':
-    args = configure_arguments_parser()
-    print(args)
-    
-    app_conf = read_conf()
-    pprint(app_conf)
+    args, parser = configure_arguments_parser()
     
     command_handlers = {
         'recommend' : recommend,
         'upload' : upload,
         'fetch': fetch
     }
-    command_handlers[args.cmd](args, app_conf)
+    handler = command_handlers.get(args.cmd, None)
+    if handler is None:
+        parser.print_help()
+        sys.exit(1)
+        
+    app_conf = read_conf()
+    
+    handler(args, app_conf)
 
     
