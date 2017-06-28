@@ -121,7 +121,9 @@ This is the most common use case and is suitable when volume of browsing and tar
    
 8. If you are interested in examination of and recommendations from YouTube videos, you need to obtain
    a YouTube API key first. 
-   See [https://developers.google.com/youtube/v3/getting-started#before-you-start](https://developers.google.com/youtube/v3/getting-started#before-you-start)on how to get an API key.
+   
+   See [https://developers.google.com/youtube/v3/getting-started#before-you-start](https://developers.google.com/youtube/v3/getting-started#before-you-start) on how to get an API key.
+   
    Then make a copy of `/root/spark/recommender/app/conf/yt_api_key_template.yml` as `/root/spark/recommender/app/conf/yt_api_key.yml`, 
    open it in an editor, and 
    insert your YouTube API key there between the double quotes. 
@@ -180,14 +182,16 @@ See [Usage](#usage) for instructions on how use the software for recommendations
    ```
 
    NUMBER-OF-TOPICS depends on your interests and your perception of how relevant the recommendations shown are. Start with a small number like 10 and then increase it in steps of 10 until the recommendations seem useful.
+   
    ​
    NUMBER-OF-ITERATIONS should not be too low.  50-100 is an ideal range.
+   
    ​
    Output Screenshots:
 
    ![Recommendations](docs/recommendation_screenshot1.png)
 
-6. ![Recommendations](docs/recommendation_screenshot2.png)
+   ![Recommendations](docs/recommendation_screenshot2.png)
 
 
 
