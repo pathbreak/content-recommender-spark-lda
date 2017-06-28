@@ -5,6 +5,7 @@ import yaml
 from pprint import pprint
 import sys
 import argparse
+import subprocess
 
 from history import HistoryProcessor
 from history_store import HistoryStore
@@ -13,8 +14,26 @@ from targets import TargetsProcessor
 from target_store import TargetStore
 
 def recommend(args, app_conf):
-    # Run LDA on spark and get topmost recommendation per topic.
-    pass
+    proc_path = os.path.join(
+        args.spark_dir if args.spark_dir is not None else '/root/spark/stockspark/spark-2.1.1-bin-hadoop2.7/',
+        'bin/spark-submit')
+        
+    proc_args = [
+        proc_path,
+        args.spark_job_jarpath if args.spark_job_jarpath is not None else '/root/spark/lda-prototype.jar',
+        args.history_dir,
+        args.target_dir,
+        args.num_topics,
+        args.num_iterations,
+        'em',
+        'custom_stopwords.txt'
+    ]
+    
+    p = subprocess.Popen(proc_args, stdout=subprocess.PIPE)
+ 
+    stdoutdata, stderrdata = p.communicate()
+    print(stdoutdata.decode('utf-8'))
+    
     
 def upload(args, app_conf):
     history_store = HistoryStore(app_conf)
@@ -49,7 +68,19 @@ def configure_arguments_parser():
     actions = parser.add_subparsers(dest='cmd', title='commands')
 
     recommend_parser = actions.add_parser('recommend', help='Show recommendations from latest fetched contents')
-
+    recommend_parser.add_argument(dest='history_dir', metavar='HISTORY-DIRECTORY', 
+        help='Directory where history contents have been stored by upload.')
+    recommend_parser.add_argument(dest='target_dir', metavar='TARGET-DIRECTORY', 
+        help='Directory where target contents have been stored by fetch.')
+    recommend_parser.add_argument(dest='num_topics', metavar='NUMBER-OF-TOPICS', 
+        help='Number of topics to discover. This depends on your interest and perceived quality of recommendations')
+    recommend_parser.add_argument(dest='num_iterations', metavar='NUMBER-OF-ITERATIONS', 
+        help='Number of iterations for LDA to execute.')
+    recommend_parser.add_argument('--spark-dir', dest='spark_dir', metavar='SPARK-INSTALLATION-DIRECTORY', required=False,
+        help='(Optional) Path of a Spark installation. Default: /root/spark/stockspark/spark-2.1.1-bin-hadoop2.7')
+    recommend_parser.add_argument('--spark-jar', dest='spark_job_jarpath', metavar='SPARK-JOB-JAR-PATH', required=False,
+        help='(Optional) Path of the Spark Job JAR. Default: /root/spark/lda-prototype.jar')
+        
     upload_parser = actions.add_parser('upload', help='Upload a browsing history JSON file')
     upload_parser.add_argument(dest='history_filepath', metavar='JSON-FILEPATH', 
         help='File path of browsing history JSON file.')

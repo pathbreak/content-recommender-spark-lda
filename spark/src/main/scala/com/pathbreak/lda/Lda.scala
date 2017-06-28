@@ -134,17 +134,8 @@ object Lda {
         similar = similar.limit(20)
             
         //println(s"\n\nSimilarity join dataset: ${similar.columns.mkString(",")}\n\n")
-        println(s"\n\nSimilarity join dataset:\n\n")
+        println(s"\n\nRecommendations:\n\n")
         
-        //similar.foreach( printRow(_) )
-        /*
-        val firstRow:Row = similar.first().asInstanceOf[Row]
-        println("First Row size: " + firstRow.size)
-        for (i <- 0 to firstRow.size-1) {
-            println(s"First Row field $i: " + firstRow.get(i).getClass)
-        }
-        println(firstRow.getAs[Row]("datasetA").getAs[String]("id"))
-        */
         similar.take(20).foreach( r => {
             val x = r.asInstanceOf[Row]
             
@@ -180,8 +171,6 @@ object Lda {
         
         val t1 = System.nanoTime()
         
-        //println(s"\n\nSimilarity join dataset rows with dupes: $similarNumRows\n\n")
-        //println(s"\n\nSimilarity join dataset rows without dupes: $similarNumRowsWithoutDups\n\n")
         println(s"Time taken for LDA:${(t1-t0) / (1e9)} s")
     }
 }

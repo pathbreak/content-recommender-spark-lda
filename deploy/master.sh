@@ -2,6 +2,10 @@
 
 SPARK_VERSION='spark-2.1.1/spark-2.1.1-bin-hadoop2.7.tgz'
 
+# 'eth0:1' is the private IP network interface on Linode.
+# Change this if deploying on a different machine or cloud.
+BIND_TO_NETWORK_INTERFACE='eth0:1'
+
 # Prepare the system to run this script.
 init() {
     apt-get -y update
@@ -22,6 +26,12 @@ install_master() {
     install_recommender_app
     
     install_spark "/root/spark/stockspark"
+
+    # Since master script will requires non-interactive ssh access to slaves when job is started, 
+    # we'll create a private key here.
+    if [ ! -f /root/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa 
+    fi
 }
 
 install_master_node_prerequisites() {
@@ -65,7 +75,55 @@ install_spark() {
     cp "/root/spark/recommender/deploy/spark-defaults.conf" "$archive_root_dir/conf/"
     cp "/root/spark/recommender/deploy/metrics.properties" "$archive_root_dir/conf/"
     
+    configure_spark_memory "$installed_dir"
+    
     echo "Spark installed in: $installed_dir"
+}
+
+# $1 -> Spark installation directory.
+configure_spark_memory() {
+    # For cluster mode, the settings will go into conf/spark-defaults.conf and
+    # conf/spark-env.sh.
+
+    # In cluster mode, there are 4 processes running on master node:
+    #  1) The Master daemon
+    #  2) The Worker daemon
+    #  3) The Executor process
+    #  4) The Driver process
+    #
+    #   - use SPARK_DAEMON_MEMORY to set Xmx for master daemon 
+    #   - the same SPARK_DAEMON_MEMORY sets Xmx for worker daemon.
+    #   - use SPARK_WORKER_MEMORY to set maximum memory across all executors. In our case, there's just 1 executor.
+    #   - use SPARK_EXECUTOR_MEMORY or "spark.executor.memory" to set Xmx for executor process. 
+    #   - use "--driver-memory" or "spark.driver.memory" to set Xmx for driver process.
+    #  
+    # Master and Worker daemons are only for job management, resource allocation, etc. So they don't need high Xmx.
+    # Executor does all the computation tasks; it should have high Xmx.
+    # But specifically for our LDA app, there is a resource-heavy collect in the driver process. So driver process
+    # too should have high Xmx.
+    # The split will be 
+    #   1GB for Master Daemon, 
+    #   1GB for Worker daemon, 
+    #   8GB for other OS processes, NFS and caches,
+    #   (RAM-10)/2 each for executor
+    #   (RAM-10)/2 for driver process.
+    
+    local spark_dir="$1"
+    local system_ram_mb=$(grep MemTotal /proc/meminfo | awk '{print $2}' | xargs -I {} echo "{}/1024" | bc)
+    
+    local other_mem_mb=8192
+    local master_mem_mb=1024
+    local worker_mem_mb=1024
+    local remaining_mem_mb=$(($system_ram_mb - $other_mem_mb - $master_mem_mb - $worker_mem_mb))
+    local executor_mem_mb=$(echo "scale=0;$remaining_mem_mb / 2" | bc)
+    local driver_mem_mb=$(echo "scale=0;$remaining_mem_mb / 2" | bc)
+    
+    local env_file="$spark_dir/conf/spark-env.sh"
+    cp "$spark_dir/conf/spark-env.sh.template" "$env_file"
+    echo "export SPARK_DAEMON_MEMORY=$master_mem_mb"M >>  "$env_file"
+    echo "export SPARK_WORKER_MEMORY=$executor_mem_mb"M >>  "$env_file"
+    echo "export SPARK_EXECUTOR_MEMORY=$executor_mem_mb"M >>  "$env_file"
+    echo "export SPARK_DRIVER_MEMORY=$driver_mem_mb"M >>  "$env_file"
 }
 
 install_recommender_app() {
@@ -112,7 +170,7 @@ run_lda_local() {
     local driver_max_heap_mb=$(echo "scale=0;$system_ram_mb * 7/10" | bc)
     local max_result_size_mb=$(echo "scale=0;$driver_max_heap_mb * 1/2" | bc)
     
-    local run_dir="/root/spark/data/sys-$(date +%Y-%m-%d-%H-%M-%S)"
+    local run_dir="/root/spark/data/master-$(date +%Y-%m-%d-%H-%M-%S)"
     start_system_metrics "$run_dir"
     
     "$spark_dir/bin/spark-submit" --driver-memory "$driver_max_heap_mb"M \
@@ -137,22 +195,18 @@ start_cluster() {
         return 1
     fi
     
-    # Since master script will requires non-interactive ssh access to slaves when job is started, 
-    # we'll create a private key here.
-    if [ ! -f /root/.ssh/id_rsa ]; then
-        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa 
-    fi
-
     # Master daemon uses SPARK_LOCAL_IP only for port 8080 (WebUI), 
     # and --host for ports 6066 (REST endpoint) and 7077 (service)
-    local private_ip=$(ip addr | grep 'eth0:1' | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
-    
+    local private_ip=$(ip addr | grep "$BIND_TO_NETWORK_INTERFACE"$ | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+
     SPARK_LOCAL_IP=$private_ip  SPARK_PUBLIC_DNS=$private_ip  \
         "$spark_dir/sbin/start-master.sh" \
         "--host $private_ip"
     
-    SPARK_LOCAL_IP=$private_ip SPARK_PUBLIC_DNS=$private_ip  \
-        "$spark_dir/sbin/start-slave.sh" "--port 7078" \
+    sleep 10
+    
+    SPARK_LOCAL_IP=$private_ip SPARK_PUBLIC_DNS=$private_ip  
+        "$spark_dir/sbin/start-slave.sh" \
         "--host $private_ip" "spark://$private_ip:7077"     
 }
 
@@ -169,6 +223,50 @@ stop_cluster() {
     
     "$spark_dir/sbin/stop-master.sh"
 }
+
+
+# Runs the LDA job in cluster mode executing tasks across all worker nodes in the cluster.
+#   $1 -> The directory where a spark installation exists to use for running this spark job.
+#   $2 -> Training data directory (under /root/spark/data/historydata/)
+#   $3 -> Targets data directory (under /root/spark/data/targetdata)
+#   $4 -> Number of topics (k)
+#   $5 -> Number of iterations
+#   $6 -> Algorithm to use. "online"|"em"
+#   $7 -> Path of a customs stop word list file
+run_lda_cluster() {
+    local spark_dir="$1"
+    if [ ! -f "$spark_dir/bin/spark-submit" ]; then
+        echo "Error: $spark_dir does not seem to be a Spark installation."
+        return 1
+    fi
+
+    # Runs the LDA spark app in cluster execution mode on the master node.
+    # In cluster mode, all the memory settings are set via conf/spark-env.sh and conf/spark-defaults.conf
+    # Nothing needs to be set here.
+    
+    local run_time=$(date +%Y-%m-%d-%H-%M-%S)
+    local run_dir="/root/spark/data/master-$run_time"
+    start_system_metrics "$run_dir"
+    
+    start_system_metrics_on_slaves "$run_time"
+    
+    local private_ip=$(ip addr | grep "$BIND_TO_NETWORK_INTERFACE"$ | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+    
+    "$spark_dir/bin/spark-submit" --master "spark://$private_ip:7077" \
+        /root/spark/lda-prototype.jar \
+        "$2" "$3" "$4" "$5" "$6" 2>&1 | tee -a "$run_dir/stdlogs"
+    
+    # Wait for sometime before stopping metrics collection, because memory and disk
+    # cleanup take some time.
+    sleep 15
+    stop_system_metrics
+    
+    stop_system_metrics_on_slaves
+}
+
+
+
+
 
 
 # Start system CPU and memory usage collection using dstat.
@@ -239,6 +337,21 @@ stop_system_metrics() {
     
 }
 
+# $1 -> the run timestamp that master wants slaves to include in metrics directories.
+start_system_metrics_on_slaves() {
+    while read slave_ip; do
+        echo "Starting metrics on $slave_ip"
+        local run_dir="/root/spark/data/slave-$slave_ip-$1"
+        ssh -i /root/.ssh/id_rsa "root@$slave_ip" /root/slave.sh start-metrics "$run_dir"
+    done < /root/slaves
+}
+
+stop_system_metrics_on_slaves() {
+    while read slave_ip; do
+        echo "Stopping metrics on $slave_ip"
+        ssh -i /root/.ssh/id_rsa "root@$slave_ip" /root/slave.sh stop-metrics
+    done < /root/slaves
+}
 
 # Periodically collects disk free stats for /dev/root
 # $1 -> Report file
@@ -266,12 +379,27 @@ disable_nfs_sharing() {
 }
 
 
-# Add a Spark slave as permitted NFS client.
+# Add a Spark slave as permitted NFS client. This is called by the slave itself
+# when it's joining the cluster.
 #   $1 => The private IP address of client. Example: 192.168.11.239
 add_slave() {
-    ssh-copy-id -i /root/.ssh/id_rsa "$1"
+    ssh-copy-id -i /root/.ssh/id_rsa "root@$1"
     
     add_nfs_client "$1"
+    
+    touch "/root/slaves"
+    grep "$1" "/root/slaves"
+    if [ $? -ne 0 ]; then
+        echo "$1" >> "/root/slaves"
+    fi
+}
+
+# Remove a Spark slave as permitted NFS client.
+#   $1 => The private IP address of client. Example: 192.168.11.239
+remove_slave() {
+    remove_nfs_client "$1"
+    
+    sed -i -r "/^$1$/ d" "/root/slaves"
 }
 
 # Add a Spark slave as permitted NFS client.
@@ -286,6 +414,22 @@ add_nfs_client() {
     if [ $? -ne 0 ]; then
         echo "/root/spark/data    $worker_ip/17(rw,sync,no_subtree_check,no_root_squash)" > /etc/exports
         exportfs -a
+    fi
+}
+
+
+# Remove a Spark slave as permitted NFS client.
+#   $1 => The private IP address of client.
+remove_nfs_client() {
+    # /etc/exports allows the same directory to be repeated on multiple lines for different clients.
+    # This makes grepping and adding or replacing much easier compared to having all clients on a 
+    # single line.
+    # The /17 subnet after slave's IP address is required.
+    local worker_ip="$1"
+    grep "$worker_ip" /etc/exports
+    if [ $? -eq 0 ]; then
+        sed -i -r "\|/root/spark/data.+$worker_ip.*$| d" /etc/exports
+        exportfs -r -v
     fi
 }
 
@@ -336,6 +480,10 @@ case "$1" in
     install_spark "$2"
     ;;
     
+    config-memory)
+    configure_spark_memory "$2"
+    ;;
+    
     install-spark-native)
     install_spark_native_stack "$2"
     ;;
@@ -356,14 +504,23 @@ case "$1" in
     add-slave)
     add_slave "$2"
     ;;
+    
+    remove-slave)
+    remove_slave "$2"
+    ;;
         
+
+    run-cluster)
+    run_lda_cluster "${@:2}"
+    ;;
+    
     
     start-metrics)
     start_system_metrics "$2"
     ;;
     
     stop-metrics)
-    stop_system_metrics "$2"
+    stop_system_metrics
     ;;
     
     collect-df)

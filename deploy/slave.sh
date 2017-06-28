@@ -2,6 +2,11 @@
 
 SPARK_VERSION='spark-2.1.1/spark-2.1.1-bin-hadoop2.7.tgz'
 
+# 'eth0:1' is the private IP network interface on Linode.
+# Change this if deploying on a different machine or cloud.
+BIND_TO_NETWORK_INTERFACE='eth0:1'
+
+
 # Prepare the system to run this script.
 init() {
     apt-get -y update
@@ -13,12 +18,12 @@ init() {
     # Check if password authentication is enabled.
     grep '^PasswordAuth' /etc/ssh/sshd_config | grep yes
     if [ $? -eq 0 ]; then
-        printf "\nSECURITY WARNING: Password authentication for SSH is enabled.\n" \
-            "This is a security risk, but this script won't disable it automatically to avoid the risk of " \
-            "leaving you without any SSH access.\n" \
-            "Please configure SSH key based authentication for this machine by following \n" \
-            "https://www.linode.com/docs/security/securing-your-server \n" \
-            "and then run ./slave.sh secure"
+        printf "\nSECURITY WARNING: Password authentication for SSH is enabled.\n \
+            This is a security risk, but this script won't disable it automatically \n \
+            to avoid the risk of leaving you without any SSH access.\n \
+            Please configure SSH key based authentication for this machine by following \n \
+            https://www.linode.com/docs/security/securing-your-server \n \
+            and then run ./slave.sh secure\n\n"
     fi
 }
 
@@ -28,6 +33,13 @@ install_slave() {
     install_recommender_app
     
     install_spark "/root/spark/stockspark"
+    
+    # Since slave script may requires non-interactive ssh access to master when job is started, 
+    # we'll create a private key here.
+    if [ ! -f /root/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa 
+    fi
+    
 }
 
 
@@ -69,8 +81,44 @@ install_spark() {
     cp "/root/spark/recommender/deploy/spark-defaults.conf" "$archive_root_dir/conf/"
     cp "/root/spark/recommender/deploy/metrics.properties" "$archive_root_dir/conf/"
     
+    configure_spark_memory "$installed_dir"
+    
     echo "Spark installed in: $installed_dir"
 }
+
+# $1 -> Spark installation directory.
+configure_spark_memory() {
+    # For cluster mode, the settings will go into conf/spark-defaults.conf and
+    # conf/spark-env.sh.
+
+    # In cluster mode, there are 2 processes running on a slave node:
+    #  1) The Worker daemon
+    #  2) The Executor process process
+    #
+    #   - use SPARK_DAEMON_MEMORY to set Xmx for worker daemon.
+    #   - use SPARK_WORKER_MEMORY to set maximum memory across all executors. In our case, there's just 1 executor.
+    #   - use SPARK_EXECUTOR_MEMORY or "spark.executor.memory" to set Xmx for executor process. 
+    #  
+    # Worker daemons is only for job management, resource allocation, etc. So it doesn't need high Xmx.
+    # Executor does all the computation tasks; it should have high Xmx.
+    # The split will be 1GB for Worker daemon, 8GB for other OS processes and caches,
+    # and remaining for executor.
+    
+    local spark_dir="$1"
+    local system_ram_mb=$(grep MemTotal /proc/meminfo | awk '{print $2}' | xargs -I {} echo "{}/1024" | bc)
+    
+    local other_mem_mb=8192
+    local worker_mem_mb=1024
+    local remaining_mem_mb=$(($system_ram_mb - $other_mem_mb - $worker_mem_mb))
+    
+    local env_file="$spark_dir/conf/spark-env.sh"
+    cp "$spark_dir/conf/spark-env.sh.template" "$env_file"
+    echo "export SPARK_DAEMON_MEMORY=$worker_mem_mb"M >>  "$env_file"
+    echo "export SPARK_WORKER_MEMORY=$remaining_mem_mb"M >>  "$env_file"
+    echo "export SPARK_EXECUTOR_MEMORY=$remaining_mem_mb"M >>  "$env_file"
+}
+
+
 
 # Starts the Spark slave daemon on this machine's private IP address.
 #   $1 -> The directory where a spark installation exists.
@@ -81,17 +129,21 @@ join_cluster() {
         echo "Error: $spark_dir does not seem to be a Spark installation."
         return 1
     fi
-
-    local master_ip="$2"
     
-    setup_nfs_shares "$master_ip"
+    local master_ip="$2"
 
-    # Master daemon uses SPARK_LOCAL_IP only for port 8080 (WebUI), 
+    # Worker daemon uses SPARK_LOCAL_IP only for port 8080 (WebUI), 
     # and --host for ports 6066 (REST endpoint) and 7077 (service)
-    local private_ip=$(ip addr | grep 'eth0:1' | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+    local private_ip=$(ip addr | grep "$BIND_TO_NETWORK_INTERFACE"$ | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+    
+    ssh_copy_id -i /root/.ssh/id_rsa "root@$master_ip" 
+    
+    ssh -i /root/.ssh/id_rsa "root@$master_ip" /root/master.sh add-slave "$private_ip"
+
+    setup_nfs_shares "$master_ip"
     
     SPARK_LOCAL_IP=$private_ip SPARK_PUBLIC_DNS=$private_ip  \
-        "$spark_dir/sbin/start-slave.sh" "--port 7078" \
+        "$spark_dir/sbin/start-slave.sh" \
         "--host $private_ip" "spark://$master_ip:7077"     
 }
 
@@ -99,6 +151,7 @@ join_cluster() {
 # Stops the Spark slave daemon on this machine.
 # Does not remove the NFS mount to master.
 #   $1 -> The directory where a spark installation exists.
+#   $2 -> Master's IP address
 leave_cluster() {
     local spark_dir="$1"
     if [ ! -f "$spark_dir/sbin/stop-slave.sh" ]; then
@@ -107,6 +160,12 @@ leave_cluster() {
     fi
 
     "$spark_dir/sbin/stop-slave.sh"
+    
+    local master_ip="$2"
+    
+    local private_ip=$(ip addr | grep "$BIND_TO_NETWORK_INTERFACE"$ | awk '{print $2}'|tr  '/' ' ' | awk '{print $1}')
+    
+    ssh -i /root/.ssh/id_rsa "root@$master_ip" /root/master.sh remove-slave "$private_ip"
 }
 
 
@@ -279,7 +338,7 @@ case "$1" in
     ;;
     
     leave-cluster)
-    leave_cluster "$2"
+    leave_cluster "$2" "$3"
     ;;
     
     
@@ -293,7 +352,7 @@ case "$1" in
     ;;
     
     stop-metrics)
-    stop_system_metrics "$2"
+    stop_system_metrics
     ;;
 
     collect-df)
